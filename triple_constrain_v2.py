@@ -73,11 +73,11 @@ SHAP_DIR.mkdir(parents=True, exist_ok=True)
 PLOTS_DIR = OUTPUT_DIR / "plots"
 PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
-EPOCHS       = 800
+EPOCHS       = 1000
 BATCH_SIZE   = 64
-LR           = 1e-3
-WEIGHT_DECAY = 1e-5
-PATIENCE     = 80
+LR           = 5e-4
+WEIGHT_DECAY = 1e-4
+PATIENCE     = 100
 GRAD_CLIP    = 1.0
 SHAP_BACKGROUND_SIZE = 128
 SHAP_EXPLAIN_SIZE = 256
@@ -100,17 +100,35 @@ HEXBIN_CMAP = LinearSegmentedColormap.from_list(
 
 # --- THE 3-PART REGIME CONSTRAINTS ---
 WASH_LOAD_MIN  = 3
-LAMBDA_FLOOR   = 0.001
-LAMBDA_CEILING = 0.005
+LAMBDA_FLOOR   = 0.002
+LAMBDA_CEILING = 0.008
 LAMBDA_MASS    = 0.05
+LAMBDA_VAR     = 0.05          # Tier 1C: variance-ratio penalty
+LAMBDA_QUANTILE = 0.03         # Fix D: quantile loss for tail
+LAMBDA_ASYM    = 0.02          # Fix G: asymmetric under-prediction penalty
+HUBER_DELTA    = 1.0           # Fix B: Huber loss delta
+QUANTILE_TAU   = 0.90          # Fix D: target quantile (90th percentile)
+USE_SSC_LAGS   = False         # Fix E: disable SSC lag features to prevent data leakage
 
 BASE_FEATURES = [
     "Q_m3s", "d50_mm", "rainfall_mm", "temp_C", "VS", "Soil_Moisture", "NDVI",
     "dQ", "Q_ratio", "Q_lag1", "Q_lag2", "Q_lag3", "Q_max_7d", "HI_proxy",
-    "API", "P_MA3", "P_MA7", "P_MA14", "P_MA30", "SPI_30"
+    "API", "P_MA3", "P_MA7", "P_MA14", "P_MA30", "SPI_30",
+    # Tier 2 features
+    "sin_doy", "cos_doy", "monsoon_flag",       # 2B: seasonal embeddings
+    "Q_cumsum_wy",                               # 2C: cumulative seasonal discharge
+    # Fix F: physics-guided feature — log(Q) for rating-curve residual learning
+    "logQ",
+    # Hydrological memory features (no SSC leakage)
+    "Q_MA3", "Q_MA7", "Q_MA14",                 # discharge moving averages
+    "dQ_MA3",                                    # smoothed discharge change
 ]
-TARGET_COL = "SSC_mgL"
-RAW_PHYS_COLS = ["Q_m3s", "d50_mm", "temp_C", "VS", "depth_m", "slope"]
+# Fix E: SSC-lag-based features — only include if USE_SSC_LAGS is True
+SSC_LAG_FEATURES = ["dSSC_lag1", "Q_SSC_lag1"]
+TARGET_COL     = "SSC_mgL"       # original column (used for reporting)
+TARGET_COL_LOG = "SSC_mgL_log"   # Tier 1A: log1p-transformed target for training
+USE_LOG_TARGET = True            # Tier 1A: toggle log-space training
+RAW_PHYS_COLS  = ["Q_m3s", "d50_mm", "temp_C", "VS", "depth_m", "slope"]
 
 def apply_publication_style():
     plt.rcParams.update({
@@ -313,13 +331,42 @@ class DataProcessor:
 
         df["SSC_LP_lag1"] = df[TARGET_COL].shift(1).ffill().fillna(0.0)
         df["SSC_LP_lag2"] = df[TARGET_COL].shift(2).ffill().fillna(0.0)
+        # Tier 2A: expanded SSC lags (3–7 day memory)
+        for k in range(3, 8):
+            df[f"SSC_LP_lag{k}"] = df[TARGET_COL].shift(k).ffill().fillna(0.0)
+        # Tier 2A: derived lag features
+        df["dSSC_lag1"]  = (df["SSC_LP_lag1"] - df["SSC_LP_lag2"]).fillna(0.0)
+        df["Q_SSC_lag1"] = df["Q_lag1"] * df["SSC_LP_lag1"] * 0.0864  # prev-day load
 
         q_val = df["Q_m3s"]
         q_delta = q_val.diff().fillna(0.0)
         q_maxroll = q_val.rolling(7, min_periods=1).max().replace(0, np.nan)
         df["HI_proxy"] = (q_delta / q_maxroll).fillna(0.0)
 
+        # Fix F: physics-guided feature — log(Q) so network learns rating-curve residuals
+        df["logQ"] = np.log1p(df["Q_m3s"].clip(lower=0))
+
+        # New: discharge moving averages (no SSC leakage, pure Q memory)
+        df["Q_MA3"]  = Q.rolling(3, min_periods=1).mean()
+        df["Q_MA7"]  = Q.rolling(7, min_periods=1).mean()
+        df["Q_MA14"] = Q.rolling(14, min_periods=1).mean()
+        df["dQ_MA3"] = df["dQ"].rolling(3, min_periods=1).mean()
+
+        # Tier 2B: seasonal / cyclical embeddings
+        doy = df["date_dt"].dt.dayofyear
+        df["sin_doy"] = np.sin(2 * np.pi * doy / 365.25)
+        df["cos_doy"] = np.cos(2 * np.pi * doy / 365.25)
+        df["monsoon_flag"] = ((df["date_dt"].dt.month >= 6) & (df["date_dt"].dt.month <= 9)).astype(float)
+
+        # Tier 1A: log-transformed target for training in log-space
+        df[TARGET_COL_LOG] = np.log1p(df[TARGET_COL].clip(lower=0))
+
         df["WY"] = df["date_dt"].apply(self._nepali_wy)
+
+        # Tier 2C: cumulative seasonal discharge (normalized within each WY)
+        df["Q_cumsum_wy"] = df.groupby("WY")["Q_m3s"].cumsum()
+        wy_max = df.groupby("WY")["Q_cumsum_wy"].transform("max").replace(0, 1.0)
+        df["Q_cumsum_wy"] = df["Q_cumsum_wy"] / wy_max
         self.full_df = df.copy()
 
         df_obs = df.dropna(subset=[TARGET_COL]).reset_index(drop=True)
@@ -337,13 +384,16 @@ class DataProcessor:
         val_all = self.full_df[self.full_df["WY"] == val_wy].copy()
         test_all = self.full_df[self.full_df["WY"] == test_wy].copy()
 
+        # Tier 1A: choose log or original target for y-scaler
+        y_col = TARGET_COL_LOG if USE_LOG_TARGET else TARGET_COL
+
         x_scaler, y_scaler = RobustScaler(), RobustScaler()
         X_tr = x_scaler.fit_transform(train[features].values)
         X_va = x_scaler.transform(val[features].values)
         X_te = x_scaler.transform(test[features].values)
-        y_tr = y_scaler.fit_transform(train[[TARGET_COL]].values)
-        y_va = y_scaler.transform(val[[TARGET_COL]].values)
-        y_te = y_scaler.transform(test[[TARGET_COL]].values)
+        y_tr = y_scaler.fit_transform(train[[y_col]].values)
+        y_va = y_scaler.transform(val[[y_col]].values)
+        y_te = y_scaler.transform(test[[y_col]].values)
 
         r_tr, r_va, r_te = train[RAW_PHYS_COLS].values, val[RAW_PHYS_COLS].values, test[RAW_PHYS_COLS].values
         
@@ -368,41 +418,165 @@ class DataProcessor:
 
 # --- MODEL ---
 class _ResBlock(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, dropout=0.1):
         super().__init__()
-        self.block = nn.Sequential(nn.Linear(dim, dim), nn.BatchNorm1d(dim), nn.LeakyReLU(0.1), nn.Dropout(0.1))
+        self.block = nn.Sequential(
+            nn.Linear(dim, dim), nn.BatchNorm1d(dim),
+            nn.LeakyReLU(0.1), nn.Dropout(dropout),
+        )
     def forward(self, x): return x + self.block(x)
 
-class ResidualMLP(nn.Module):
-    def __init__(self, in_dim):
+
+# Tier 3A: lightweight self-attention on temporal feature tokens
+class _TemporalAttention(nn.Module):
+    """Single-head self-attention over a set of temporal feature tokens."""
+    def __init__(self, n_tokens, token_dim=1, embed_dim=32):
         super().__init__()
-        self.project = nn.Sequential(nn.Linear(in_dim, 128), nn.LeakyReLU(0.1))
-        self.blocks  = nn.Sequential(*[_ResBlock(128) for _ in range(6)])
-        self.head    = nn.Linear(128, 1)
-    def forward(self, x): return self.head(self.blocks(self.project(x)))
+        self.proj = nn.Linear(token_dim, embed_dim)
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads=1, batch_first=True)
+        self.out_dim = n_tokens * embed_dim
+
+    def forward(self, tokens):
+        # tokens: [batch, n_tokens, token_dim]
+        h = self.proj(tokens)                          # [B, T, E]
+        h, _ = self.attn(h, h, h)                      # self-attention
+        return h.reshape(h.size(0), -1)                # [B, T*E]
+
+
+# Tier 3B: Mixture of Experts with gated regime switching
+class _ExpertMLP(nn.Module):
+    def __init__(self, in_dim, hidden, n_blocks, dropout=0.1):
+        super().__init__()
+        self.project = nn.Sequential(nn.Linear(in_dim, hidden), nn.LeakyReLU(0.1))
+        self.blocks = nn.Sequential(*[_ResBlock(hidden, dropout) for _ in range(n_blocks)])
+        self.head = nn.Linear(hidden, 1)
+
+    def forward(self, x):
+        return self.head(self.blocks(self.project(x)))
+
+
+# Indices of temporal features within the feature vector (set dynamically in main)
+# Core temporal features that always exist (Q-based, no SSC leakage)
+TEMPORAL_FEAT_NAMES_CORE = [
+    "dQ", "Q_ratio", "Q_lag1", "Q_lag2", "Q_lag3", "Q_max_7d", "HI_proxy",
+    "Q_MA3", "Q_MA7", "Q_MA14", "dQ_MA3",
+]
+# SSC-lag temporal features — only used when USE_SSC_LAGS is True
+TEMPORAL_FEAT_NAMES_SSC = [
+    "dSSC_lag1", "Q_SSC_lag1",
+] + [f"SSC_LP_lag{k}" for k in range(1, 8)]
+
+
+class ResidualMLP(nn.Module):
+    """MoE-Attention PINN: attention on temporal features + 3-expert mixture."""
+    def __init__(self, in_dim, temporal_indices=None):
+        super().__init__()
+        self.temporal_indices = temporal_indices or []
+        n_temporal = len(self.temporal_indices)
+        n_static = in_dim - n_temporal
+        # precompute static feature indices
+        temp_set = set(self.temporal_indices)
+        self.static_indices = [i for i in range(in_dim) if i not in temp_set]
+
+        # Tier 3A: temporal attention stream
+        self.use_attn = n_temporal > 0
+        if self.use_attn:
+            self.temp_attn = _TemporalAttention(n_temporal, token_dim=1, embed_dim=32)
+            attn_out = n_temporal * 32
+        else:
+            attn_out = 0
+
+        # Static features projection
+        self.static_proj = nn.Sequential(
+            nn.Linear(n_static, 64), nn.LeakyReLU(0.1),
+        ) if n_static > 0 else None
+        static_out = 64 if n_static > 0 else 0
+
+        fused_dim = attn_out + static_out
+
+        # Tier 3B: three experts (dry / normal / flood)
+        self.gate = nn.Sequential(nn.Linear(fused_dim, 3), nn.Softmax(dim=-1))
+        self.expert_dry    = _ExpertMLP(fused_dim, hidden=64,  n_blocks=3, dropout=0.15)
+        self.expert_normal = _ExpertMLP(fused_dim, hidden=128, n_blocks=4, dropout=0.10)
+        self.expert_flood  = _ExpertMLP(fused_dim, hidden=128, n_blocks=4, dropout=0.10)
+
+        # Tier 5C: learned physics gate — soft weights for floor/ceiling constraints
+        self.physics_gate = nn.Sequential(
+            nn.Linear(fused_dim, 16), nn.LeakyReLU(0.1),
+            nn.Linear(16, 2), nn.Sigmoid(),  # [floor_weight, ceiling_weight] in [0,1]
+        )
+
+    def forward(self, x, return_physics_gate=False):
+        parts = []
+        if self.use_attn:
+            temp_feats = x[:, self.temporal_indices].unsqueeze(-1)  # [B, T, 1]
+            parts.append(self.temp_attn(temp_feats))
+
+        if self.static_proj is not None:
+            static_feats = x[:, self.static_indices]
+            parts.append(self.static_proj(static_feats))
+
+        fused = torch.cat(parts, dim=-1)
+
+        # Gated mixture of experts
+        weights = self.gate(fused)                      # [B, 3]
+        e1 = self.expert_dry(fused)                     # [B, 1]
+        e2 = self.expert_normal(fused)
+        e3 = self.expert_flood(fused)
+        experts = torch.cat([e1, e2, e3], dim=-1)       # [B, 3]
+        out = (weights * experts).sum(dim=-1, keepdim=True)  # [B, 1]
+
+        if return_physics_gate:
+            pg = self.physics_gate(fused.detach())       # [B, 2] — detach to not backprop SSC gradient through gate
+            return out, pg
+        return out
 
 # --- PHYSICS EQUATION (Yang) ---
 def get_yang_capacity(phys_tensor):
+    """Yang (1979) total-load transport formula — corrected fall velocity."""
     a1, a2, a3, a4, a5, a6 = 7.1178, -1.3908, -3.3899, 5.5007, -1.6111, -3.9525
-    d50_m, temp, VS, depth, slope = phys_tensor[:, 1]*1e-3, phys_tensor[:, 2], phys_tensor[:, 3], phys_tensor[:, 4], phys_tensor[:, 5]
+    d50_m = phys_tensor[:, 1] * 1e-3
+    temp  = phys_tensor[:, 2]
+    VS    = phys_tensor[:, 3]
+    depth = phys_tensor[:, 4]
+    slope = phys_tensor[:, 5]
+
+    # Kinematic viscosity (m²/s) as a function of temperature
     nu = torch.clamp(1.14e-6 - 3.0e-9 * temp, min=1e-7)
     d = torch.clamp(d50_m, min=1e-6)
-    w = torch.sqrt(torch.clamp(1.65 * 9.81 * d, min=1e-12))
-    w = w * (2.0/3.0 + 36.0 * nu / (9.81 * d**2 * 1.65 + 1e-12))
-    u_s = torch.sqrt(torch.clamp(9.81 * depth * slope, min=1e-12))
-    
-    l_wd = torch.log10(torch.clamp(w*d50_m/1e-6, min=1e-8))
-    l_us = torch.log10(torch.clamp(u_s/torch.clamp(w, min=1e-8), min=1e-8))
-    l_VS = torch.log10(torch.clamp(VS/torch.clamp(w, min=1e-8), min=1e-8))
-    
+
+    # Rubey (1933) fall velocity — corrected formula
+    # F = 2/3 + 36*nu / sqrt(g * (Gs-1) * d^3) — dimensionless correction
+    Gs_minus_1 = 1.65  # specific gravity of sediment minus 1
+    g = 9.81
+    denom_F = torch.sqrt(torch.clamp(g * Gs_minus_1 * d**3, min=1e-18))
+    F = torch.clamp(2.0/3.0 + 36.0 * nu / (denom_F + 1e-12), min=0.01, max=1.0)
+    w = F * torch.sqrt(torch.clamp(g * Gs_minus_1 * d, min=1e-12))
+
+    # Shear velocity
+    u_s = torch.sqrt(torch.clamp(g * depth * slope, min=1e-12))
+
+    l_wd = torch.log10(torch.clamp(w * d50_m / 1e-6, min=1e-8))
+    l_us = torch.log10(torch.clamp(u_s / torch.clamp(w, min=1e-8), min=1e-8))
+    l_VS = torch.log10(torch.clamp(VS / torch.clamp(w, min=1e-8), min=1e-8))
+
     l_Ct_phys = (a1 + a2*l_wd + a3*l_us + (a4 + a5*l_wd + a6*l_us) * l_VS)
     return torch.pow(10.0, l_Ct_phys)
 
 # --- TRAINING WITH REGIME-SWITCHING ---
+def _to_mgl(scaled_vals, y_center, y_scale):
+    """Convert scaled network output back to mg/L, handling log-transform."""
+    raw = scaled_vals * y_scale + y_center          # unscale
+    if USE_LOG_TARGET:
+        return torch.expm1(raw).clamp(min=0.0)      # log-space → mg/L
+    return raw
+
+
 def train_model(model, loaders, y_scaler):
     model = model.to(DEVICE)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=15, factor=0.5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    # Cosine annealing with warm restarts — better convergence for PINNs
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=200, T_mult=2, eta_min=1e-6)
     amp_scaler = GradScaler(enabled=USE_AMP)
     y_center = torch.tensor(y_scaler.center_[0], dtype=torch.float32, device=DEVICE)
     y_scale = torch.tensor(y_scaler.scale_[0], dtype=torch.float32, device=DEVICE)
@@ -411,10 +585,10 @@ def train_model(model, loaders, y_scaler):
     all_actuals, all_yangs, all_qs = [], [], []
     for batch in loaders["train"]:
         yb, pb = batch[1].to(DEVICE), batch[2].to(DEVICE)
-        actual_mgl = yb.squeeze() * y_scale + y_center
+        actual_mgl = _to_mgl(yb.squeeze(), y_center, y_scale)
         yang_cap = get_yang_capacity(pb)
         q_val = pb[:, 0]
-        
+
         all_actuals.append(actual_mgl)
         all_yangs.append(yang_cap)
         all_qs.append(q_val)
@@ -430,58 +604,114 @@ def train_model(model, loaders, y_scaler):
     extreme_yangs = all_yangs[top_5_mask]
     alpha = torch.median(extreme_actuals / torch.clamp(extreme_yangs, min=1e-6)).item()
     global_q_mean = torch.mean(all_qs)
-    
+
     q_95th_value = q_95th.item()
     global_q_mean_value = global_q_mean.item()
+
+    # Tier 1B: pre-compute global max SSC for peak weighting
+    global_max_ssc = all_actuals.max().item()
 
     print(f"        -> Top 5% Flow Threshold: {q_95th_value:.2f} m³/s")
     print(f"        -> Extreme Flood Multiplier (Alpha): {alpha:.4f}")
 
     best_val, wait, best_state = float("inf"), 0, None
-    loss_tracker = {"Data": 0, "Floor": 0, "Ceiling": 0, "Mass": 0}
+    loss_tracker = {"Data": 0, "Floor": 0, "Ceiling": 0, "Mass": 0, "Var": 0, "Quantile": 0, "Asym": 0}
+
+    # Tier 4B: curriculum learning — build weighted sampler for phase 2
+    # Fix: use P90 threshold instead of P75 to focus on truly extreme events
+    CURRICULUM_EPOCH = EPOCHS // 2   # switch at epoch 400 (half of 800)
+    train_ds = loaders["train"].dataset
+    ssc_90th = torch.quantile(all_actuals, 0.90).item()
+    sample_weights = torch.ones(len(train_ds))
+    train_y_mgl = all_actuals.cpu()
+    # Graduated weighting: moderate boost for P75+, strong boost for P90+
+    ssc_75th = torch.quantile(all_actuals, 0.75).item()
+    sample_weights[train_y_mgl >= ssc_75th] = 2.0
+    sample_weights[train_y_mgl >= ssc_90th] = 5.0
+    curriculum_sampler = torch.utils.data.WeightedRandomSampler(
+        sample_weights, num_samples=len(train_ds), replacement=True,
+    )
+    curriculum_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=curriculum_sampler)
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
-        ep_data, ep_down, ep_up, ep_mass = 0.0, 0.0, 0.0, 0.0
-        
-        for batch in loaders["train"]:
+        ep_data, ep_down, ep_up, ep_mass, ep_var, ep_quant, ep_asym = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+        # Tier 1D: warm-up ramp for physics losses
+        progress = epoch / EPOCHS
+        ramp = min(1.0, max(0.0, (progress - 0.125) / 0.25))
+
+        # Tier 4B: switch to curriculum loader in second half of training
+        active_loader = curriculum_loader if epoch >= CURRICULUM_EPOCH else loaders["train"]
+
+        for batch in active_loader:
             xb, yb, pb = batch[0].to(DEVICE), batch[1].to(DEVICE), batch[2].to(DEVICE)
             optimizer.zero_grad()
             with autocast(enabled=USE_AMP):
-                pred = model(xb)
-                data_loss = nn.functional.mse_loss(pred, yb)
-                
-                pr_mgl = pred.squeeze() * y_scale + y_center
-                yb_mgl = yb.squeeze() * y_scale + y_center
-                q_vals = pb[:, 0] 
-                
-                low_mask = q_vals < global_q_mean
-                floor_loss = torch.tensor(0.0, device=DEVICE)
-                if low_mask.any():
-                    floor_penalty = torch.nn.functional.relu(pr_mgl[low_mask] - WASH_LOAD_MIN)
-                    floor_loss = torch.mean((floor_penalty / y_scale)**2)
-                
-                high_mask = q_vals >= global_q_mean
-                ceiling_loss = torch.tensor(0.0, device=DEVICE)
-                if high_mask.any():
-                    yang_cap_calibrated = get_yang_capacity(pb[high_mask]) * alpha
-                    ceiling_penalty = torch.nn.functional.relu(yang_cap_calibrated - pr_mgl[high_mask])
-                    ceiling_loss = torch.mean((ceiling_penalty / y_scale)**2)
-                
+                pred, phys_gate = model(xb, return_physics_gate=True)
+                # phys_gate: [B, 2] — [:,0]=floor_weight, [:,1]=ceiling_weight
+
+                # Fix B: Huber loss instead of plain MSE — robust to extreme outliers
+                pr_mgl = _to_mgl(pred.squeeze(), y_center, y_scale)
+                yb_mgl = _to_mgl(yb.squeeze(), y_center, y_scale)
+                data_loss = torch.nn.functional.huber_loss(
+                    pred.squeeze(), yb.squeeze(), delta=HUBER_DELTA
+                )
+
+                # Tier 5C: learned physics gates (soft, per-sample)
+                floor_w = phys_gate[:, 0]    # [B] in [0, 1]
+                ceil_w  = phys_gate[:, 1]    # [B] in [0, 1]
+
+                # Fix A: CORRECTED floor — penalize predictions BELOW wash-load minimum
+                floor_penalty = torch.nn.functional.relu(WASH_LOAD_MIN - pr_mgl)
+                floor_loss = torch.mean(floor_w * floor_penalty ** 2)
+
+                # Fix A: CORRECTED ceiling — penalize predictions ABOVE Yang capacity
+                yang_cap_calibrated = get_yang_capacity(pb) * alpha
+                ceiling_penalty = torch.nn.functional.relu(pr_mgl - yang_cap_calibrated)
+                ceiling_loss = torch.mean(ceil_w * ceiling_penalty ** 2)
+
                 mass_diff = torch.abs(torch.sum(pr_mgl) - torch.sum(yb_mgl))
-                mass_loss = (mass_diff / len(yb)) / y_scale 
-                
-                weighted_floor   = LAMBDA_FLOOR * floor_loss
-                weighted_ceiling = LAMBDA_CEILING * ceiling_loss
-                weighted_mass    = LAMBDA_MASS * mass_loss
-                
-                loss = data_loss + weighted_floor + weighted_ceiling + weighted_mass
-                
+                mass_loss = mass_diff / (len(yb) + 1e-6)
+
+                # Tier 1C: variance-ratio penalty
+                var_loss = torch.tensor(0.0, device=DEVICE)
+                if len(yb) > 2:
+                    std_pred = torch.std(pr_mgl)
+                    std_obs = torch.std(yb_mgl).clamp(min=1e-6)
+                    var_loss = (std_pred / std_obs - 1.0) ** 2
+
+                # Fix D: quantile loss — better capture of upper tail (P90)
+                diff_qt = yb.squeeze() - pred.squeeze()
+                quantile_loss = torch.mean(
+                    torch.max(QUANTILE_TAU * diff_qt, (QUANTILE_TAU - 1.0) * diff_qt)
+                )
+
+                # Fix G: asymmetric penalty — underprediction 3x worse than overprediction
+                under_pred = torch.nn.functional.relu(yb_mgl - pr_mgl)
+                over_pred  = torch.nn.functional.relu(pr_mgl - yb_mgl)
+                asym_loss  = (3.0 * torch.mean(under_pred) + 0.5 * torch.mean(over_pred)) / (global_max_ssc + 1e-6)
+
+                # Tier 1D: apply warm-up ramp to physics and auxiliary losses
+                weighted_floor   = ramp * LAMBDA_FLOOR * floor_loss
+                weighted_ceiling = ramp * LAMBDA_CEILING * ceiling_loss
+                weighted_mass    = ramp * LAMBDA_MASS * mass_loss
+                weighted_var     = ramp * LAMBDA_VAR * var_loss
+                weighted_quant   = ramp * LAMBDA_QUANTILE * quantile_loss
+                weighted_asym    = ramp * LAMBDA_ASYM * asym_loss
+
+                loss = (data_loss + weighted_floor + weighted_ceiling
+                        + weighted_mass + weighted_var
+                        + weighted_quant + weighted_asym)
+
                 ep_data += data_loss.item()
                 ep_down += weighted_floor.item()
                 ep_up += weighted_ceiling.item()
                 ep_mass += weighted_mass.item()
-                
+                ep_var += weighted_var.item()
+                ep_quant += weighted_quant.item()
+                ep_asym += weighted_asym.item()
+
             amp_scaler.scale(loss).backward()
             nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             amp_scaler.step(optimizer)
@@ -493,13 +723,13 @@ def train_model(model, loaders, y_scaler):
             for b in loaders["val"]:
                 val_loss += nn.functional.mse_loss(model(b[0].to(DEVICE)), b[1].to(DEVICE), reduction="sum").item()
         val_loss /= len(loaders["val"].dataset)
-        scheduler.step(val_loss)
+        scheduler.step(epoch)
 
         if val_loss < best_val: 
             # Clone tensors to snapshot weights without relying on the stdlib copy module.
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
             best_val, wait = val_loss, 0
-            loss_tracker = {"Data": ep_data, "Floor": ep_down, "Ceiling": ep_up, "Mass": ep_mass}
+            loss_tracker = {"Data": ep_data, "Floor": ep_down, "Ceiling": ep_up, "Mass": ep_mass, "Var": ep_var, "Quantile": ep_quant, "Asym": ep_asym}
         else:
             wait += 1
             if wait >= PATIENCE: break
@@ -780,23 +1010,37 @@ def main():
     apply_publication_style()
     proc = DataProcessor(DATA_PATH)
     
-    feats = BASE_FEATURES + ["SSC_LP_lag1", "SSC_LP_lag2"]
+    # Fix E: conditionally include SSC lag features based on USE_SSC_LAGS toggle
+    feats = list(BASE_FEATURES)
+    if USE_SSC_LAGS:
+        feats += SSC_LAG_FEATURES + [f"SSC_LP_lag{k}" for k in range(1, 8)]
+        print("[CONFIG] SSC lag features ENABLED (data leakage risk in deployment)")
+    else:
+        print("[CONFIG] SSC lag features DISABLED (no data leakage — honest evaluation)")
     data = proc.split_and_scale(feats)
     
     # Run Baseline SRC Hysteresis before training
     run_src_hysteresis_baseline(data["dfs"])
     
-    print(f"\n[RUN] Training Model with {len(feats)} features on RTX 4060...")
-    model = ResidualMLP(len(feats))
+    # Tier 3: compute temporal feature indices for attention
+    temporal_feat_names = list(TEMPORAL_FEAT_NAMES_CORE)
+    if USE_SSC_LAGS:
+        temporal_feat_names += TEMPORAL_FEAT_NAMES_SSC
+    temporal_indices = [feats.index(f) for f in temporal_feat_names if f in feats]
+    print(f"\n[RUN] Training MoE-Attention PINN with {len(feats)} features ({len(temporal_indices)} temporal)...")
+    model = ResidualMLP(len(feats), temporal_indices=temporal_indices)
     model, loss_tracker, physics_meta = train_model(model, data["loaders"], data["y_scaler"])
     
     total_loss = sum(loss_tracker.values())
     if total_loss > 0:
         print("\n[IMPACT OF EQUATIONS] Loss Component Breakdown (Best Epoch):")
-        print(f"  - Data (Observations) : {loss_tracker['Data'] / total_loss * 100:.2f}%")
+        print(f"  - Data (Huber)        : {loss_tracker['Data'] / total_loss * 100:.2f}%")
         print(f"  - Floor (Wash Load)   : {loss_tracker['Floor'] / total_loss * 100:.2f}%")
         print(f"  - Ceiling (Yang Cap)  : {loss_tracker['Ceiling'] / total_loss * 100:.2f}%")
         print(f"  - Driver (Mass Bal)   : {loss_tracker['Mass'] / total_loss * 100:.2f}%")
+        print(f"  - Variance Penalty    : {loss_tracker['Var'] / total_loss * 100:.2f}%")
+        print(f"  - Quantile (P{int(QUANTILE_TAU*100)})      : {loss_tracker['Quantile'] / total_loss * 100:.2f}%")
+        print(f"  - Asymmetric (peaks)  : {loss_tracker['Asym'] / total_loss * 100:.2f}%")
 
     model.eval()
     results = {}
@@ -812,8 +1056,12 @@ def main():
             for b in eval_loader:
                 preds.append(model(b[0].to(DEVICE)).cpu())
         
-        # Calculate SSC predictions
-        p_ssc = data["y_scaler"].inverse_transform(torch.cat(preds).numpy()).flatten()
+        # Calculate SSC predictions — inverse-scale then undo log if needed
+        p_ssc_raw = data["y_scaler"].inverse_transform(torch.cat(preds).numpy()).flatten()
+        if USE_LOG_TARGET:
+            p_ssc = np.expm1(p_ssc_raw).clip(min=0.0)   # log-space → mg/L
+        else:
+            p_ssc = p_ssc_raw
         a_ssc = data["dfs"][phase][TARGET_COL].values
         
         # Fetch Discharge (Q) to calculate Load
@@ -874,7 +1122,11 @@ def main():
             for b in all_loader:
                 all_preds.append(model(b[0].to(DEVICE)).cpu())
 
-        p_ssc_all = data["y_scaler"].inverse_transform(torch.cat(all_preds).numpy()).flatten()
+        p_ssc_all_raw = data["y_scaler"].inverse_transform(torch.cat(all_preds).numpy()).flatten()
+        if USE_LOG_TARGET:
+            p_ssc_all = np.expm1(p_ssc_all_raw).clip(min=0.0)
+        else:
+            p_ssc_all = p_ssc_all_raw
         q_all = all_df["Q_m3s"].values
         p_load_all = p_ssc_all * q_all * 0.0864
         all_day_results[phase] = {

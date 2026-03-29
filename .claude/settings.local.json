@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''triple_constrain_v2.py''\\).read\\(\\)\\); print\\(''Syntax OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''optuna_search.py''\\).read\\(\\)\\); print\\(''optuna_search.py Syntax OK''\\)\")",
+      "Bash(python -c \":*)",
+      "Bash(python triple_constrain_v3.py)"
+    ]
+  }
+}
